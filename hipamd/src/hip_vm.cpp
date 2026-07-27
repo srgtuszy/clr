@@ -229,6 +229,17 @@ hipError_t hipMemGetAllocationGranularity(size_t* granularity, const hipMemAlloc
   const auto& dev_info = amdContext->devices()[0]->info();
 
   *granularity = dev_info.virtualMemAllocGranularity_;
+  if (!useHostDevice) {
+    const char* env_granularity = getenv("HIP_VMM_GRANULARITY");
+    if (env_granularity != nullptr) {
+      size_t val = strtoul(env_granularity, nullptr, 10);
+      if (val > 0) {
+        *granularity = val;
+      }
+    } else {
+      *granularity = 2 * 1024 * 1024; // Force 2MB alignment for device allocations
+    }
+  }
 
   HIP_RETURN(hipSuccess);
 }
@@ -365,25 +376,28 @@ hipError_t hipMemSetAccess(void* ptr, size_t size, const hipMemAccessDesc* desc,
   if (mem_object) {
     memLocationType = static_cast<hipMemLocationType>(mem_object->getUserData().locationType);
     if (mem_object->parent()) {
-      bool buffer_match = false;
-      size_t accumulated_buffer_size = 0;
-      size_t subbuffer_size = 0;
-      for (auto sub_buffer : mem_object->parent()->subBuffers()) {
-        size_t current_size = sub_buffer->getSize();
-        accumulated_buffer_size += current_size;
-        if (sub_buffer->getSvmPtr() == ptr) {
-          subbuffer_size = current_size;
-          buffer_match = true;
+      size_t total_size = 0;
+      address current_ptr = static_cast<address>(ptr);
+      address end_ptr = current_ptr + size;
+
+      while (current_ptr < end_ptr) {
+        bool match = false;
+        for (auto sub_buffer : mem_object->parent()->subBuffers()) {
+          if (static_cast<address>(sub_buffer->getSvmPtr()) == current_ptr) {
+            total_size += sub_buffer->getSize();
+            current_ptr += sub_buffer->getSize();
+            match = true;
+            break;
+          }
+        }
+        if (!match) {
+          break;
         }
       }
-      if (!buffer_match) {
-        LogPrintfError("Requested addr %p not mapped!", ptr);
-        HIP_RETURN(hipErrorInvalidValue);
-      }
-      if (subbuffer_size != size && accumulated_buffer_size != size) {
-        LogPrintfError(
-          "Given size %zu doesn't match sub-buffer size %zu or accumulated size %zu!",
-          size, subbuffer_size, accumulated_buffer_size);
+
+      if (total_size != size) {
+        LogPrintfError("Requested range [%p, %p) is not fully covered by mapped sub-buffers! total_size=%zu, size=%zu",
+                       ptr, (char*)ptr + size, total_size, size);
         HIP_RETURN(hipErrorInvalidValue);
       }
     }
